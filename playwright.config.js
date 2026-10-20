@@ -21,6 +21,7 @@ const testEnv = {
     GITHUB_APP_CLIENT_ID: process.env.GITHUB_APP_CLIENT_ID,
     GITHUB_APP_CLIENT_SECRET: process.env.GITHUB_APP_CLIENT_SECRET,
     GITHUB_APP_PRIVATE_KEY: process.env.GITHUB_APP_PRIVATE_KEY,
+    GITHUB_WEBHOOK_SECRET: process.env.GITHUB_WEBHOOK_SECRET,
 };
 
 export default defineConfig({
@@ -30,12 +31,12 @@ export default defineConfig({
             command: 'node tests/fake-github/start.js',
             port: fakeGitHubPort,
             env: { FAKE_GITHUB_PORT: String(fakeGitHubPort) },
-            reuseExistingServer: !process.env.CI,
+            reuseExistingServer: false,
         },
         {
             command: 'pnpm preview',
             port: 4173,
-            reuseExistingServer: !process.env.CI,
+            reuseExistingServer: false,
             gracefulShutdown: { signal: 'SIGINT', timeout: 0 },
             env: testEnv,
         },
@@ -50,6 +51,7 @@ export default defineConfig({
     maxFailures: 1,
     reporter: 'dot',
     fullyParallel: false,
+    workers: 1,
     forbidOnly: Boolean(process.env.CI),
     failOnEmptyTestSuite: false,
 });

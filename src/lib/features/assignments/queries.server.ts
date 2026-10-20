@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 
-import { and, desc, eq, isNull } from 'drizzle-orm';
+import { and, desc, eq, isNull, lt, or, sql } from 'drizzle-orm';
 
 import { assignments, programs, rosterEntries, submissions, users } from '$lib/server/db/schema';
-import type { DbConnection } from '$lib/server/db';
+import type { DbConnection, DbTransaction } from '$lib/server/db';
 import { Logger } from '$lib/server/telemetry/logger';
 import { Tracer } from '$lib/server/telemetry/tracer';
+
+import type { GradingMode } from './contracts';
 
 const SERVICE_NAME = 'assignments.queries';
 const logger = Logger.byName(SERVICE_NAME);
@@ -18,6 +20,8 @@ export interface CreateAssignmentArgs {
     name: string;
     deadline: Date;
     templateRepo: string;
+    gradingMode: GradingMode;
+    maxScore?: number; // Should only be defined if gradingMode === 'manual'
 }
 
 /**
@@ -49,6 +53,8 @@ export async function createAssignmentForProgram(db: DbConnection, args: CreateA
                 name: args.name,
                 deadline: args.deadline,
                 templateRepo: args.templateRepo,
+                gradingMode: args.gradingMode,
+                maxScore: typeof args.maxScore === 'number' ? args.maxScore.toFixed(2) : null,
                 inviteToken: randomBytes(32).toString('base64url'),
             })
             .returning();
@@ -94,10 +100,15 @@ export async function getAssignmentForInstructor(
 
         const students = await db
             .select({
+                submissionId: submissions.id,
                 name: rosterEntries.name,
                 login: users.login,
                 avatarUrl: users.avatarUrl,
                 repoName: submissions.repoName,
+                score: submissions.score,
+                maxScore: submissions.maxScore,
+                gradedAt: submissions.gradedAt,
+                gradingConclusion: submissions.gradingConclusion,
             })
             .from(rosterEntries)
             .leftJoin(users, eq(rosterEntries.claimedUserId, users.id))
@@ -189,7 +200,7 @@ export async function getClaimedRosterEntry(db: DbConnection, programId: string,
         span.setAttributes({ 'program.id': programId, 'user.id': userId });
 
         const [entry] = await db
-            .select({ name: rosterEntries.name })
+            .select({ id: rosterEntries.id, name: rosterEntries.name })
             .from(rosterEntries)
             .where(
                 and(
@@ -201,5 +212,330 @@ export async function getClaimedRosterEntry(db: DbConnection, programId: string,
         if (typeof entry === 'undefined') return null;
 
         return entry;
+    });
+}
+
+/**
+ * Resolves the submission a repository belongs to. A repository identifies a
+ * submission only by the program org it lives in and its name, so `ambiguous`
+ * means two assignments claim the same repository — a state the caller must
+ * refuse to grade rather than guess between.
+ */
+export type SubmissionLookup =
+    | {
+          status: 'found';
+          submissionId: string;
+          assignmentId: string;
+          gradingWorkflow: string | null;
+          gradingMode: GradingMode;
+      }
+    | { status: 'missing' }
+    | { status: 'ambiguous' };
+
+const submissionLookupColumns = {
+    submissionId: submissions.id,
+    assignmentId: assignments.id,
+    gradingWorkflow: assignments.gradingWorkflow,
+    gradingMode: assignments.gradingMode,
+} as const;
+
+function submissionLookupWhere(org: string, repoName: string) {
+    return and(eq(programs.org, org), eq(submissions.repoName, repoName));
+}
+
+interface SubmissionLookupRow {
+    submissionId: string;
+    assignmentId: string;
+    gradingWorkflow: string | null;
+    gradingMode: GradingMode;
+}
+
+function toSubmissionLookup(rows: SubmissionLookupRow[]): SubmissionLookup {
+    const [row, duplicate] = rows;
+    if (typeof row === 'undefined') return { status: 'missing' };
+    if (typeof duplicate !== 'undefined') return { status: 'ambiguous' };
+    return { status: 'found', ...row };
+}
+
+export async function resolveSubmissionForRepo(
+    db: DbConnection,
+    org: string,
+    repoName: string,
+): Promise<SubmissionLookup> {
+    return await tracer.asyncSpan('resolve-submission-for-repo', async (span) => {
+        span.setAttributes({ 'github.org': org, 'submission.repo_name': repoName });
+
+        const rows = await db
+            .select(submissionLookupColumns)
+            .from(submissions)
+            .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+            .innerJoin(programs, eq(assignments.programId, programs.id))
+            .where(submissionLookupWhere(org, repoName))
+            .limit(2);
+
+        return toSubmissionLookup(rows);
+    });
+}
+
+/**
+ * Resolves the submission a repository belongs to while holding a row lock on
+ * it, so a caller can decide and write against the same row without a deletion
+ * or a competing grade slipping in between. The lookup predicate is part of the
+ * locked statement, so only a row the caller may grade is ever locked.
+ */
+export async function lockSubmissionForRepo(
+    tx: DbTransaction,
+    org: string,
+    repoName: string,
+): Promise<SubmissionLookup> {
+    return await tracer.asyncSpan('lock-submission-for-repo', async (span) => {
+        span.setAttributes({ 'github.org': org, 'submission.repo_name': repoName });
+
+        const rows = await tx
+            .select(submissionLookupColumns)
+            .from(submissions)
+            .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+            .innerJoin(programs, eq(assignments.programId, programs.id))
+            .where(submissionLookupWhere(org, repoName))
+            .limit(2)
+            .for('update');
+
+        return toSubmissionLookup(rows);
+    });
+}
+
+/**
+ * Writes a manual score, scoped to the assignment the caller may grade: the
+ * submission id alone would let a caller touch a row outside that assignment.
+ */
+export async function setSubmissionScore(
+    db: DbConnection,
+    submissionId: string,
+    assignmentId: string,
+    score: string,
+    maxScore: string,
+) {
+    return await tracer.asyncSpan('set-submission-score', async (span) => {
+        span.setAttributes({ 'submission.id': submissionId, 'assignment.id': assignmentId });
+
+        return await db
+            .update(submissions)
+            .set({
+                score,
+                maxScore,
+                gradedAt: new Date(),
+                gradingConclusion: null,
+            })
+            .where(
+                and(eq(submissions.id, submissionId), eq(submissions.assignmentId, assignmentId)),
+            )
+            .returning({ id: submissions.id });
+    });
+}
+
+/** A completed workflow run, in the shape both the webhook and the polling path see it. */
+export interface GradingRun {
+    id: number;
+    name: string;
+    checkSuiteId: number;
+    headSha: string;
+    conclusion: string | null;
+}
+
+export interface GradingRunScore {
+    score: number;
+    maxScore: number;
+}
+
+export type ClaimRosterEntryOutcome =
+    { rosterEntryId: string } | { status: 'entry-missing' | 'entry-claimed' };
+
+function isUniqueViolation(error: unknown) {
+    return (
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        (error as { code?: unknown }).code === '23505'
+    );
+}
+
+/**
+ * Claims the named roster entry for the user. The conditional UPDATE is what
+ * makes the claim atomic: an entry another student claimed first matches no
+ * row, and the follow-up lookup says whether the name exists at all.
+ */
+export async function claimRosterEntry(
+    db: DbConnection,
+    args: { programId: string; userId: string; entryName: string },
+): Promise<ClaimRosterEntryOutcome> {
+    return await tracer.asyncSpan('claim-roster-entry', async (span) => {
+        span.setAttributes({ 'program.id': args.programId, 'user.id': args.userId });
+
+        let claimedRows: { id: string }[];
+        try {
+            claimedRows = await db
+                .update(rosterEntries)
+                .set({ claimedUserId: args.userId, claimedAt: new Date() })
+                .where(
+                    and(
+                        eq(rosterEntries.programId, args.programId),
+                        eq(rosterEntries.name, args.entryName),
+                        isNull(rosterEntries.claimedUserId),
+                    ),
+                )
+                .returning({ id: rosterEntries.id });
+        } catch (error) {
+            // Two concurrent claims by the same user trip the
+            // `(programId, claimedUserId)` unique index; use whichever entry won.
+            if (!isUniqueViolation(error)) throw error;
+
+            const winners = await db
+                .select({ id: rosterEntries.id })
+                .from(rosterEntries)
+                .where(
+                    and(
+                        eq(rosterEntries.programId, args.programId),
+                        eq(rosterEntries.claimedUserId, args.userId),
+                    ),
+                )
+                .limit(1);
+            const [winner] = winners;
+            assert(typeof winner !== 'undefined', 'concurrent claim left no winning entry');
+            claimedRows = [winner];
+        }
+        const [claimedRow] = claimedRows;
+
+        if (typeof claimedRow === 'undefined') {
+            const [existing] = await db
+                .select({ id: rosterEntries.id, claimedUserId: rosterEntries.claimedUserId })
+                .from(rosterEntries)
+                .where(
+                    and(
+                        eq(rosterEntries.programId, args.programId),
+                        eq(rosterEntries.name, args.entryName),
+                    ),
+                )
+                .limit(1);
+
+            if (typeof existing !== 'undefined') {
+                // The user's own concurrent request may have claimed this entry
+                // between our conditional UPDATE and this lookup; treat that as
+                // success rather than a conflict.
+                if (existing.claimedUserId === args.userId) {
+                    span.setAttribute('roster.entry_id', existing.id);
+                    return { rosterEntryId: existing.id };
+                }
+                return { status: 'entry-claimed' };
+            }
+
+            logger.debug('roster entry not found for the given name', {
+                'program.id': args.programId,
+            });
+            return { status: 'entry-missing' };
+        }
+
+        span.setAttribute('roster.entry_id', claimedRow.id);
+        return { rosterEntryId: claimedRow.id };
+    });
+}
+
+/** Reads the submission recorded for an assignment and repository name, if any. */
+export async function getSubmissionByRepoName(
+    db: DbConnection,
+    assignmentId: string,
+    repoName: string,
+) {
+    return await tracer.asyncSpan('get-submission-by-repo-name', async (span) => {
+        span.setAttributes({ 'assignment.id': assignmentId, 'submission.repo_name': repoName });
+
+        const [submission] = await db
+            .select({ repoName: submissions.repoName })
+            .from(submissions)
+            .where(
+                and(eq(submissions.assignmentId, assignmentId), eq(submissions.repoName, repoName)),
+            )
+            .limit(1);
+        if (typeof submission === 'undefined') return null;
+
+        return submission;
+    });
+}
+
+/** Records the submission a student's accepted assignment created. */
+export async function recordSubmission(
+    db: DbConnection,
+    assignmentId: string,
+    rosterEntryId: string,
+    repoName: string,
+) {
+    return await tracer.asyncSpan('record-submission', async (span) => {
+        span.setAttributes({
+            'assignment.id': assignmentId,
+            'submission.roster_entry_id': rosterEntryId,
+            'submission.repo_name': repoName,
+        });
+
+        await db
+            .insert(submissions)
+            .values({ assignmentId, rosterEntryId, repoName })
+            .onConflictDoNothing();
+    });
+}
+
+/**
+ * Writes one completed run's grade, guarded by the monotonic run id so a
+ * redelivered or out-of-order delivery cannot overwrite a newer grade. Returns
+ * whether the row was written; a locked, existing submission that matches no
+ * row means an equal-or-newer run is already stored.
+ */
+export async function writeGradingRunSubmission(
+    tx: DbTransaction,
+    args: { submissionId: string; run: GradingRun; score: GradingRunScore | null },
+) {
+    return await tracer.asyncSpan('write-grading-run-submission', async (span) => {
+        span.setAttributes({
+            'submission.id': args.submissionId,
+            'github.workflow_run.id': args.run.id,
+        });
+
+        const updated = await tx
+            .update(submissions)
+            .set({
+                score: args.score === null ? null : args.score.score.toFixed(2),
+                maxScore: args.score === null ? null : args.score.maxScore.toFixed(2),
+                gradedAt: sql`now()`,
+                gradingRunId: args.run.id,
+                gradingConclusion: args.run.conclusion,
+                gradingHeadSha: args.run.headSha,
+            })
+            .where(
+                and(
+                    eq(submissions.id, args.submissionId),
+                    or(isNull(submissions.gradingRunId), lt(submissions.gradingRunId, args.run.id)),
+                ),
+            );
+
+        const { rowCount } = updated;
+        assert(rowCount !== null, 'submission update returned no row count');
+        return rowCount > 0;
+    });
+}
+
+/** Learns the assignment's grading workflow from the first run that reported a score. */
+export async function learnGradingWorkflow(
+    tx: DbTransaction,
+    assignmentId: string,
+    workflowName: string,
+) {
+    return await tracer.asyncSpan('learn-grading-workflow', async (span) => {
+        span.setAttributes({
+            'assignment.id': assignmentId,
+            'github.workflow_run.name': workflowName,
+        });
+
+        await tx
+            .update(assignments)
+            .set({ gradingWorkflow: workflowName })
+            .where(eq(assignments.id, assignmentId));
     });
 }

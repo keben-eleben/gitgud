@@ -60,3 +60,51 @@ export const PullRequestSchema = v.object({
 });
 export type PullRequest = v.InferOutput<typeof PullRequestSchema>;
 export const PullRequestsSchema = v.array(PullRequestSchema);
+
+/** One check run of a check suite; `annotations_count` gates the annotation read. */
+export const CheckRunSchema = v.object({
+    id: v.number(),
+    output: v.object({ annotations_count: v.number() }),
+});
+export type CheckRun = v.InferOutput<typeof CheckRunSchema>;
+
+export const CheckRunsSchema = v.object({ check_runs: v.array(CheckRunSchema) });
+
+/** A check run annotation; the autograding marker lives in its `title` and `message`. */
+export const CheckRunAnnotationSchema = v.object({
+    title: v.nullable(v.string()),
+    message: v.string(),
+});
+export type CheckRunAnnotation = v.InferOutput<typeof CheckRunAnnotationSchema>;
+
+export const CheckRunAnnotationsSchema = v.array(CheckRunAnnotationSchema);
+
+/** One workflow run; `check_suite_id` reaches the run's check runs and annotations. */
+export const WorkflowRunSchema = v.object({
+    id: v.number(),
+    name: v.string(),
+    check_suite_id: v.number(),
+    head_sha: v.string(),
+    conclusion: v.nullable(v.string()),
+});
+export type WorkflowRun = v.InferOutput<typeof WorkflowRunSchema>;
+
+export const WorkflowRunsSchema = v.object({ workflow_runs: v.array(WorkflowRunSchema) });
+
+/** The `workflow_run` delivery fields a grading decision is made from. */
+export const WorkflowRunWebhookSchema = v.object({
+    action: v.string(),
+    installation: v.object({ id: v.number() }),
+    repository: v.object({
+        name: v.string(),
+        owner: v.object({ login: v.string() }),
+    }),
+    workflow_run: v.object({
+        id: v.number(),
+        name: v.string(),
+        check_suite_id: v.number(),
+        head_sha: v.string(),
+        conclusion: v.nullable(v.string()),
+    }),
+});
+export type WorkflowRunWebhook = v.InferOutput<typeof WorkflowRunWebhookSchema>;
